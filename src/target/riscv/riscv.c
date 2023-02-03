@@ -191,6 +191,47 @@ uint32_t bscan_tunnel_nested_tap_select_dmi_num_fields = ARRAY_SIZE(_bscan_tunne
 struct scan_field *bscan_tunnel_data_register_select_dmi = _bscan_tunnel_data_register_select_dmi;
 uint32_t bscan_tunnel_data_register_select_dmi_num_fields = ARRAY_SIZE(_bscan_tunnel_data_register_select_dmi);
 
+enum lattice_family {
+	LF_CERTUSPRO_NX,
+	LF_AVANT
+};
+
+enum lattice_family lattice_tunnel_family = LF_CERTUSPRO_NX;
+unsigned int lattice_hub_id = 17;
+bool lattice_tunnel_core_enabled;
+
+uint8_t lattice_ir_coreaddress[4] = {0x32};
+struct scan_field lattice_scan_ir_coreaddress = {
+	.in_value = NULL,
+	.out_value = lattice_ir_coreaddress
+};
+
+uint8_t lattice_dr_coreaddress_control[1] = {0x06};
+uint8_t lattice_dr_coreaddress_hub_id[4];
+struct scan_field lattice_scan_dr_coreaddress[] = {
+	{
+		.num_bits = 4,
+		.in_value = NULL,
+		.out_value = lattice_dr_coreaddress_control
+	},
+	{
+		/* .num_bits set in init as it varies by family */
+		.in_value = NULL,
+		.out_value = lattice_dr_coreaddress_hub_id
+	},
+	{
+		.num_bits = 1,
+		.in_value = NULL,
+		.out_value = bscan_zero
+	}
+};
+
+uint8_t lattice_ir_coredata[4] = {0x38};
+struct scan_field lattice_scan_ir_coredata = {
+	.in_value = NULL,
+	.out_value = lattice_ir_coredata
+};
+
 struct trigger {
 	uint64_t address;
 	uint32_t length;
@@ -275,13 +316,29 @@ void riscv_sample_buf_maybe_add_timestamp(struct target *target, bool before)
 
 static int riscv_resume_go_all_harts(struct target *target);
 
+static void lattice_tunnel_select(struct target *target)
+{
+	if (!lattice_tunnel_core_enabled) {
+		jtag_add_ir_scan(target->tap, &lattice_scan_ir_coreaddress, TAP_IDLE);
+		jtag_add_dr_scan(target->tap, ARRAY_SIZE(lattice_scan_dr_coreaddress), lattice_scan_dr_coreaddress, TAP_IDLE);
+
+		lattice_tunnel_core_enabled = true;
+	}
+
+	jtag_add_ir_scan(target->tap, &lattice_scan_ir_coredata, TAP_IDLE);
+}
+
 void select_dmi_via_bscan(struct target *target)
 {
-	jtag_add_ir_scan(target->tap, &select_user4, TAP_IDLE);
+	if (bscan_tunnel_type == BSCAN_TUNNEL_LATTICE)
+		lattice_tunnel_select(target);
+	else
+		jtag_add_ir_scan(target->tap, &select_user4, TAP_IDLE);
+
 	if (bscan_tunnel_type == BSCAN_TUNNEL_DATA_REGISTER)
 		jtag_add_dr_scan(target->tap, bscan_tunnel_data_register_select_dmi_num_fields,
 										bscan_tunnel_data_register_select_dmi, TAP_IDLE);
-	else /* BSCAN_TUNNEL_NESTED_TAP */
+	else /* BSCAN_TUNNEL_NESTED_TAP or BSCAN_TUNNEL_LATTICE */
 		jtag_add_dr_scan(target->tap, bscan_tunnel_nested_tap_select_dmi_num_fields,
 										bscan_tunnel_nested_tap_select_dmi, TAP_IDLE);
 }
@@ -325,7 +382,7 @@ uint32_t dtmcontrol_scan_via_bscan(struct target *target, uint32_t out)
 		tunneled_dr[3].out_value = bscan_one;
 		tunneled_dr[3].in_value = NULL;
 	} else {
-		/* BSCAN_TUNNEL_NESTED_TAP */
+		/* BSCAN_TUNNEL_NESTED_TAP or BSCAN_TUNNEL_LATTICE */
 		tunneled_ir[3].num_bits = 3;
 		tunneled_ir[3].out_value = bscan_zero;
 		tunneled_ir[3].in_value = NULL;
@@ -352,7 +409,12 @@ uint32_t dtmcontrol_scan_via_bscan(struct target *target, uint32_t out)
 		tunneled_dr[0].out_value = bscan_one;
 		tunneled_dr[0].in_value = NULL;
 	}
-	jtag_add_ir_scan(target->tap, &select_user4, TAP_IDLE);
+
+	if (bscan_tunnel_type == BSCAN_TUNNEL_LATTICE)
+		lattice_tunnel_select(target);
+	else
+		jtag_add_ir_scan(target->tap, &select_user4, TAP_IDLE);
+
 	jtag_add_dr_scan(target->tap, ARRAY_SIZE(tunneled_ir), tunneled_ir, TAP_IDLE);
 	jtag_add_dr_scan(target->tap, ARRAY_SIZE(tunneled_dr), tunneled_dr, TAP_IDLE);
 	select_dmi_via_bscan(target);
@@ -449,17 +511,37 @@ static int riscv_init_target(struct command_context *cmd_ctx,
 	select_idcode.num_bits = target->tap->ir_length;
 
 	if (bscan_tunnel_ir_width != 0) {
-		assert(target->tap->ir_length >= 6);
-		uint32_t ir_user4_raw = 0x23 << (target->tap->ir_length - 6);
-		ir_user4[0] = (uint8_t)ir_user4_raw;
-		ir_user4[1] = (uint8_t)(ir_user4_raw >>= 8);
-		ir_user4[2] = (uint8_t)(ir_user4_raw >>= 8);
-		ir_user4[3] = (uint8_t)(ir_user4_raw >>= 8);
-		select_user4.num_bits = target->tap->ir_length;
+		if (bscan_tunnel_type == BSCAN_TUNNEL_LATTICE) {
+			assert(target->tap->ir_length == 8);
+
+			lattice_tunnel_core_enabled = false;
+
+			lattice_scan_ir_coreaddress.num_bits = target->tap->ir_length;
+			lattice_scan_ir_coredata.num_bits = target->tap->ir_length;
+
+			unsigned int hub_id_max = 0;
+			if (lattice_tunnel_family == LF_CERTUSPRO_NX)
+				hub_id_max = 19;
+			else if (lattice_tunnel_family == LF_AVANT)
+				hub_id_max = 25;
+
+			assert(lattice_hub_id < hub_id_max);
+			buf_set_u32(lattice_dr_coreaddress_hub_id, 0, hub_id_max, 1<<lattice_hub_id);
+			lattice_scan_dr_coreaddress[1].num_bits = hub_id_max;
+		} else {
+			assert(target->tap->ir_length >= 6);
+			uint32_t ir_user4_raw = 0x23 << (target->tap->ir_length - 6);
+			ir_user4[0] = (uint8_t)ir_user4_raw;
+			ir_user4[1] = (uint8_t)(ir_user4_raw >>= 8);
+			ir_user4[2] = (uint8_t)(ir_user4_raw >>= 8);
+			ir_user4[3] = (uint8_t)(ir_user4_raw >>= 8);
+			select_user4.num_bits = target->tap->ir_length;
+		}
+
 		bscan_tunneled_ir_width[0] = bscan_tunnel_ir_width;
 		if (bscan_tunnel_type == BSCAN_TUNNEL_DATA_REGISTER)
 			bscan_tunnel_data_register_select_dmi[1].num_bits = bscan_tunnel_ir_width;
-		else /* BSCAN_TUNNEL_NESTED_TAP */
+		else /* BSCAN_TUNNEL_NESTED_TAP or BSCAN_TUNNEL_LATTICE */
 			bscan_tunnel_nested_tap_select_dmi[2].num_bits = bscan_tunnel_ir_width;
 	}
 
@@ -2908,6 +2990,8 @@ COMMAND_HANDLER(riscv_use_bscan_tunnel)
 		LOG_INFO("Nested Tap based Bscan Tunnel Selected");
 	else if (tunnel_type == BSCAN_TUNNEL_DATA_REGISTER)
 		LOG_INFO("Simple Register based Bscan Tunnel Selected");
+	else if (tunnel_type == BSCAN_TUNNEL_LATTICE)
+		LOG_INFO("Lattice Tunnel Selected");
 	else
 		LOG_INFO("Invalid Tunnel type selected ! : selecting default Nested Tap Type");
 
@@ -3323,7 +3407,7 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 			"the width of the DM transport TAP's instruction register to "
 			"enable.  Supply a value of 0 to disable. Pass A second argument "
 			"(optional) to indicate Bscan Tunnel Type {0:(default) NESTED_TAP , "
-			"1: DATA_REGISTER}"
+			"1: DATA_REGISTER, 2: LATTICE}"
 	},
 	{
 		.name = "set_enable_virt2phys",
@@ -4785,7 +4869,10 @@ int riscv_init_registers(struct target *target)
 void riscv_add_bscan_tunneled_scan(struct target *target, struct scan_field *field,
 					riscv_bscan_tunneled_scan_context_t *ctxt)
 {
-	jtag_add_ir_scan(target->tap, &select_user4, TAP_IDLE);
+	if (bscan_tunnel_type == BSCAN_TUNNEL_LATTICE)
+		lattice_tunnel_select(target);
+	else
+		jtag_add_ir_scan(target->tap, &select_user4, TAP_IDLE);
 
 	memset(ctxt->tunneled_dr, 0, sizeof(ctxt->tunneled_dr));
 	if (bscan_tunnel_type == BSCAN_TUNNEL_DATA_REGISTER) {
@@ -4804,7 +4891,7 @@ void riscv_add_bscan_tunneled_scan(struct target *target, struct scan_field *fie
 		ctxt->tunneled_dr[0].num_bits = 3;
 		ctxt->tunneled_dr[0].out_value = bscan_zero;
 	} else {
-		/* BSCAN_TUNNEL_NESTED_TAP */
+		/* BSCAN_TUNNEL_NESTED_TAP or BSCAN_TUNNEL_LATTICE */
 		ctxt->tunneled_dr[0].num_bits = 1;
 		ctxt->tunneled_dr[0].out_value = bscan_one;
 		ctxt->tunneled_dr[1].num_bits = 7;
