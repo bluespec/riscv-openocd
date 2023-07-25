@@ -232,6 +232,72 @@ struct scan_field lattice_scan_ir_coredata = {
 	.out_value = lattice_ir_coredata
 };
 
+unsigned int achronix_unit_id = 49;
+bool achronix_tunnel_core_enabled;
+
+static const uint8_t bscan_b01[4] = {1};
+static const uint8_t bscan_b11[4] = {3};
+static const uint8_t bscan_b10000[4] = {0x10};
+
+struct scan_field _bscan_tunnel_achronix_select_dmi[] = {
+		{
+			.num_bits = 2,
+			.out_value = bscan_b01,
+			.in_value = NULL,
+		},
+		{
+			.num_bits = 7,
+			.out_value = bscan_tunneled_ir_width,
+			.in_value = NULL,
+		},
+		{
+			.num_bits = 0, /* initialized in riscv_init_target to ir width of DM */
+			.out_value = ir_dbus,
+			.in_value = NULL,
+		},
+		{
+			.num_bits = 5,
+			.out_value = bscan_b10000,
+			.in_value = NULL,
+		}
+};
+struct scan_field *bscan_tunnel_achronix_select_dmi = _bscan_tunnel_achronix_select_dmi;
+uint32_t bscan_tunnel_achronix_select_dmi_num_fields = ARRAY_SIZE(_bscan_tunnel_achronix_select_dmi);
+
+uint8_t achronix_ir_coreaddress[4] = {0x3a, 0x01, 0x02};
+struct scan_field achronix_scan_ir_coreaddress = {
+	.in_value = NULL,
+	.out_value = achronix_ir_coreaddress
+};
+
+uint8_t achronix_dr_coreaddress_unit_id[4];
+struct scan_field achronix_scan_dr_coreaddress[] = {
+	{
+		.num_bits = 1,
+		.in_value = NULL,
+		.out_value = bscan_one
+	},
+	{
+		.num_bits = 6,
+		.in_value = NULL,
+		.out_value = achronix_dr_coreaddress_unit_id
+	}
+};
+
+uint8_t achronix_ir_coredata[4] = {0x3a, 0x00, 0x02};
+struct scan_field achronix_scan_ir_coredata = {
+	.in_value = NULL,
+	.out_value = achronix_ir_coredata
+};
+
+struct scan_field achronix_scan_dr_coredata_addr[] = {
+	{
+		.num_bits = 1,
+		.in_value = NULL,
+		.out_value = bscan_one
+	}
+};
+
 struct trigger {
 	uint64_t address;
 	uint32_t length;
@@ -328,16 +394,34 @@ static void lattice_tunnel_select(struct target *target)
 	jtag_add_ir_scan(target->tap, &lattice_scan_ir_coredata, TAP_IDLE);
 }
 
+static void achronix_tunnel_select(struct target *target)
+{
+	if (!achronix_tunnel_core_enabled) {
+		jtag_add_ir_scan(target->tap, &achronix_scan_ir_coreaddress, TAP_IDLE);
+		jtag_add_dr_scan(target->tap, ARRAY_SIZE(achronix_scan_dr_coreaddress), achronix_scan_dr_coreaddress, TAP_IDLE);
+
+		achronix_tunnel_core_enabled = true;
+	}
+
+	jtag_add_ir_scan(target->tap, &achronix_scan_ir_coredata, TAP_IDLE);
+	jtag_add_dr_scan(target->tap, ARRAY_SIZE(achronix_scan_dr_coredata_addr), achronix_scan_dr_coredata_addr, TAP_IDLE);
+}
+
 void select_dmi_via_bscan(struct target *target)
 {
 	if (bscan_tunnel_type == BSCAN_TUNNEL_LATTICE)
 		lattice_tunnel_select(target);
+	else if (bscan_tunnel_type == BSCAN_TUNNEL_ACHRONIX)
+		achronix_tunnel_select(target);
 	else
 		jtag_add_ir_scan(target->tap, &select_user4, TAP_IDLE);
 
 	if (bscan_tunnel_type == BSCAN_TUNNEL_DATA_REGISTER)
 		jtag_add_dr_scan(target->tap, bscan_tunnel_data_register_select_dmi_num_fields,
 										bscan_tunnel_data_register_select_dmi, TAP_IDLE);
+	else if (bscan_tunnel_type == BSCAN_TUNNEL_ACHRONIX)
+		jtag_add_dr_scan(target->tap, bscan_tunnel_achronix_select_dmi_num_fields,
+										bscan_tunnel_achronix_select_dmi, TAP_IDLE);
 	else /* BSCAN_TUNNEL_NESTED_TAP or BSCAN_TUNNEL_LATTICE */
 		jtag_add_dr_scan(target->tap, bscan_tunnel_nested_tap_select_dmi_num_fields,
 										bscan_tunnel_nested_tap_select_dmi, TAP_IDLE);
@@ -381,6 +465,35 @@ uint32_t dtmcontrol_scan_via_bscan(struct target *target, uint32_t out)
 		tunneled_dr[3].num_bits = 1;
 		tunneled_dr[3].out_value = bscan_one;
 		tunneled_dr[3].in_value = NULL;
+	} else if (bscan_tunnel_type == BSCAN_TUNNEL_ACHRONIX) {
+		tunneled_ir_width[0]++;
+		tunneled_dr_width[0]++;
+
+		tunneled_ir[3].num_bits = 5;
+		tunneled_ir[3].out_value = bscan_b10000;
+		tunneled_ir[3].in_value = NULL;
+		tunneled_ir[2].num_bits = bscan_tunnel_ir_width;
+		tunneled_ir[2].out_value = ir_dtmcontrol;
+		tunneled_ir[1].in_value = NULL;
+		tunneled_ir[1].num_bits = 7;
+		tunneled_ir[1].out_value = tunneled_ir_width;
+		tunneled_ir[2].in_value = NULL;
+		tunneled_ir[0].num_bits = 2;
+		tunneled_ir[0].out_value = bscan_b01;
+		tunneled_ir[0].in_value = NULL;
+
+		tunneled_dr[3].num_bits = 5;
+		tunneled_dr[3].out_value = bscan_b10000;
+		tunneled_dr[3].in_value = NULL;
+		tunneled_dr[2].num_bits = 32;
+		tunneled_dr[2].out_value = out_value;
+		tunneled_dr[2].in_value = in_value;
+		tunneled_dr[1].num_bits = 7;
+		tunneled_dr[1].out_value = tunneled_dr_width;
+		tunneled_dr[1].in_value = NULL;
+		tunneled_dr[0].num_bits = 2;
+		tunneled_dr[0].out_value = bscan_b11;
+		tunneled_dr[0].in_value = NULL;
 	} else {
 		/* BSCAN_TUNNEL_NESTED_TAP or BSCAN_TUNNEL_LATTICE */
 		tunneled_ir[3].num_bits = 3;
@@ -412,6 +525,8 @@ uint32_t dtmcontrol_scan_via_bscan(struct target *target, uint32_t out)
 
 	if (bscan_tunnel_type == BSCAN_TUNNEL_LATTICE)
 		lattice_tunnel_select(target);
+	else if (bscan_tunnel_type == BSCAN_TUNNEL_ACHRONIX)
+		achronix_tunnel_select(target);
 	else
 		jtag_add_ir_scan(target->tap, &select_user4, TAP_IDLE);
 
@@ -528,6 +643,14 @@ static int riscv_init_target(struct command_context *cmd_ctx,
 			assert(lattice_hub_id < hub_id_max);
 			buf_set_u32(lattice_dr_coreaddress_hub_id, 0, hub_id_max, 1<<lattice_hub_id);
 			lattice_scan_dr_coreaddress[1].num_bits = hub_id_max;
+		} else if (bscan_tunnel_type == BSCAN_TUNNEL_ACHRONIX) {
+			achronix_tunnel_core_enabled = false;
+
+			achronix_scan_ir_coreaddress.num_bits = target->tap->ir_length;
+			achronix_scan_ir_coredata.num_bits = target->tap->ir_length;
+
+			assert(achronix_unit_id < 0x40);
+			buf_set_u32(achronix_dr_coreaddress_unit_id, 0, 6, achronix_unit_id);
 		} else {
 			assert(target->tap->ir_length >= 6);
 			uint32_t ir_user4_raw = 0x23 << (target->tap->ir_length - 6);
@@ -541,6 +664,10 @@ static int riscv_init_target(struct command_context *cmd_ctx,
 		bscan_tunneled_ir_width[0] = bscan_tunnel_ir_width;
 		if (bscan_tunnel_type == BSCAN_TUNNEL_DATA_REGISTER)
 			bscan_tunnel_data_register_select_dmi[1].num_bits = bscan_tunnel_ir_width;
+		else if (bscan_tunnel_type == BSCAN_TUNNEL_ACHRONIX) {
+			bscan_tunnel_achronix_select_dmi[2].num_bits = bscan_tunnel_ir_width;
+			bscan_tunneled_ir_width[0]++;
+		}
 		else /* BSCAN_TUNNEL_NESTED_TAP or BSCAN_TUNNEL_LATTICE */
 			bscan_tunnel_nested_tap_select_dmi[2].num_bits = bscan_tunnel_ir_width;
 	}
@@ -2992,6 +3119,8 @@ COMMAND_HANDLER(riscv_use_bscan_tunnel)
 		LOG_INFO("Simple Register based Bscan Tunnel Selected");
 	else if (tunnel_type == BSCAN_TUNNEL_LATTICE)
 		LOG_INFO("Lattice Tunnel Selected");
+	else if (tunnel_type == BSCAN_TUNNEL_ACHRONIX)
+		LOG_INFO("Achronix Tunnel Selected");
 	else
 		LOG_INFO("Invalid Tunnel type selected ! : selecting default Nested Tap Type");
 
@@ -3407,7 +3536,7 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 			"the width of the DM transport TAP's instruction register to "
 			"enable.  Supply a value of 0 to disable. Pass A second argument "
 			"(optional) to indicate Bscan Tunnel Type {0:(default) NESTED_TAP , "
-			"1: DATA_REGISTER, 2: LATTICE}"
+			"1: DATA_REGISTER, 2: LATTICE, 3: ACHRONIX}"
 	},
 	{
 		.name = "set_enable_virt2phys",
@@ -4871,6 +5000,8 @@ void riscv_add_bscan_tunneled_scan(struct target *target, struct scan_field *fie
 {
 	if (bscan_tunnel_type == BSCAN_TUNNEL_LATTICE)
 		lattice_tunnel_select(target);
+	else if (bscan_tunnel_type == BSCAN_TUNNEL_ACHRONIX)
+		achronix_tunnel_select(target);
 	else
 		jtag_add_ir_scan(target->tap, &select_user4, TAP_IDLE);
 
@@ -4890,6 +5021,17 @@ void riscv_add_bscan_tunneled_scan(struct target *target, struct scan_field *fie
 
 		ctxt->tunneled_dr[0].num_bits = 3;
 		ctxt->tunneled_dr[0].out_value = bscan_zero;
+	} else if (bscan_tunnel_type == BSCAN_TUNNEL_ACHRONIX) {
+		ctxt->tunneled_dr[0].num_bits = 2;
+		ctxt->tunneled_dr[0].out_value = bscan_b11;
+		ctxt->tunneled_dr[1].num_bits = 7;
+		ctxt->tunneled_dr_width = field->num_bits + 1;
+		ctxt->tunneled_dr[1].out_value = &ctxt->tunneled_dr_width;
+		ctxt->tunneled_dr[2].num_bits = field->num_bits;
+		ctxt->tunneled_dr[2].out_value = field->out_value;
+		ctxt->tunneled_dr[2].in_value = field->in_value;
+		ctxt->tunneled_dr[3].num_bits = 5;
+		ctxt->tunneled_dr[3].out_value = bscan_b10000;
 	} else {
 		/* BSCAN_TUNNEL_NESTED_TAP or BSCAN_TUNNEL_LATTICE */
 		ctxt->tunneled_dr[0].num_bits = 1;
